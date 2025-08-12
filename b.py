@@ -1,0 +1,257 @@
+import asyncio
+import websockets
+import json
+import httpx
+import time
+import os
+from pathlib import Path
+from playwright.async_api import async_playwright
+
+# --- 配置区域 ---
+# 我已根据您提供的信息为您填好所有配置
+
+# 【主群】接收所有通知 (动态、视频、直播、机器人报错)
+PUSH_GROUP_ID = 977105881
+
+# 【新功能】支持多个副群，请在此列表中填入群号
+# 副群仅接收动态和直播通知 (不含机器人报错)
+# 例如: [111111111, 222222222]，如果不需要副群，请保持为空列表 []
+SECONDARY_GROUP_IDS = [849429676,908732510,150468458]
+
+# [已配置] OneBot V11 服务端的 WebSocket 连接地址
+ONEBOT_WEBSOCKET_URL = "ws://127.0.0.1:15700/onebot/v11/ws"
+
+# [已配置] 您要关注的 Bilibili UP 主的 UID
+TARGET_UID = 316381099
+
+# [已配置] 您要监控的直播间 ID
+TARGET_LIVE_ROOM_ID = 15152878
+
+# [已配置] 您的B站Cookie JSON文件的完整路径
+COOKIE_FILE_PATH = r"C:\Users\Administrator\Desktop\kanotic\bilicookie.json"
+
+# 【已修改】轮询检查间隔（秒）
+CHECK_INTERVAL_SECONDS = 3
+
+# 其他配置
+SCREENSHOT_FILE = "temp_dynamic_screenshot.png"
+
+# --- 全局变量 ---
+last_state = {
+    "last_dynamic_id": "0", 
+    "last_live_status": -1, 
+    "last_live_title": "", 
+    "last_live_cover_url": ""
+}
+user_name_cache = f"UID:{TARGET_UID}"
+BROWSER_HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36', 'Referer': 'https://www.bilibili.com/'}
+
+
+# --- Cookie处理函数 ---
+def load_cookie_from_file(file_path):
+    print(f"[*] 正在从路径加载Cookie文件: {file_path}")
+    try:
+        path = Path(file_path)
+        if not path.is_file():
+            print(f"[!] [严重错误] Cookie文件未找到！路径: {path}")
+            return None
+        with open(path, 'r', encoding='utf-8') as f: content = f.read()
+        if not content:
+            print(f"[!] [严重错误] Cookie文件 '{path.name}' 为空！")
+            return None
+        print("[+] Cookie文件内容加载成功。")
+        return content
+    except Exception as e:
+        print(f"[!] [严重错误] 加载Cookie文件时失败: {e}")
+        return None
+
+def parse_cookies_for_playwright(cookie_json_string):
+    print("[*] 正在解析和清理Cookie...")
+    try:
+        cookies = json.loads(cookie_json_string)
+        valid_same_site_values = ["Strict", "Lax", "None"]
+        for cookie in cookies:
+            if 'sameSite' in cookie and cookie['sameSite'] not in valid_same_site_values:
+                cookie['sameSite'] = 'Lax'
+        print("[+] Cookie清理完成。")
+        return cookies
+    except Exception as e:
+        print(f"[!] 清理Cookie时发生未知错误: {e}")
+        return None
+
+# --- 截图核心功能 ---
+async def screenshot_dynamic(browser, dynamic_id, cookies):
+    dynamic_url = f"https://t.bilibili.com/{dynamic_id}"
+    context = None
+    try:
+        context = await browser.new_context(viewport={'width': 800, 'height': 1200}, device_scale_factor=2)
+        await context.add_cookies(cookies)
+        page = await context.new_page()
+        await page.goto(dynamic_url, wait_until='networkidle', timeout=30000)
+        dynamic_card_selector = ".bili-dyn-item"
+        card_element = await page.wait_for_selector(dynamic_card_selector, timeout=15000)
+        await page.evaluate("""(selector) => {
+            const uselessSelectors = ['.bili-dyn-action', '.bili-dyn-up-list', '.bili-dyn-seme'];
+            uselessSelectors.forEach(s => { const elem = document.querySelector(s); if (elem) elem.style.display = 'none'; });
+            const targetElem = document.querySelector(selector);
+            if(targetElem) { targetElem.style.padding = '15px'; targetElem.style.backgroundColor = '#FFFFFF'; }
+        }""", dynamic_card_selector)
+        await card_element.screenshot(path=SCREENSHOT_FILE)
+        return os.path.abspath(SCREENSHOT_FILE)
+    except Exception as e:
+        print(f"[!] [严重错误] 截图过程中失败: {e}")
+        error_msg = f"【机器人警告】为动态 {dynamic_id} 截图失败。\n错误: {e}"
+        await send_group_message(PUSH_GROUP_ID, [{'type': 'text', 'data': {'text': error_msg}}])
+        return None
+    finally:
+        if context: await context.close()
+
+# --- OneBot 及其他辅助函数 ---
+async def send_group_message(group_id, message_parts):
+    """【已优化】不再等待服务端回执，增强兼容性"""
+    if not group_id: return
+    message_str = ""
+    for part in message_parts:
+        if part['type'] == 'text': message_str += part['data']['text']
+        elif part['type'] == 'image':
+            file_path = part['data']['file']
+            if file_path.startswith("http"): message_str += f"[CQ:image,file={file_path}]"
+            elif os.path.exists(file_path): message_str += f"[CQ:image,file=file:///{os.path.abspath(file_path)}]"
+    print(f"[+] 准备发送消息到群 {group_id}...")
+    payload = {"action": "send_group_msg", "params": {"group_id": group_id, "message": message_str}}
+    try:
+        async with websockets.connect(ONEBOT_WEBSOCKET_URL, open_timeout=10) as websocket:
+            await websocket.send(json.dumps(payload))
+            # 【关键修改】不再等待一个可能永远不会到来的回执，直接认为发送成功
+            print(f"[+] 消息已成功发送到 WebSocket。")
+    except Exception as e:
+        print(f"[!] [严重错误] 发送消息到群 {group_id} 失败: {e}.")
+
+async def broadcast_message(message_parts):
+    """向主群和所有副群广播“干净”的通知"""
+    await send_group_message(PUSH_GROUP_ID, message_parts)
+    for group_id in SECONDARY_GROUP_IDS:
+        await send_group_message(group_id, message_parts)
+
+# --- 核心检查逻辑 ---
+
+async def check_live_status(httpx_client):
+    """检查直播状态，并按分流规则推送到群组。"""
+    global last_state, user_name_cache
+    print(f"[*] 开始检查直播间状态...")
+    live_api_url = f"https://api.live.bilibili.com/room/v1/Room/get_info?room_id={TARGET_LIVE_ROOM_ID}"
+    try:
+        resp = await httpx_client.get(live_api_url)
+        resp.raise_for_status()
+        live_data = resp.json()
+        if live_data.get('code') != 0: raise Exception(f"API返回错误: {live_data.get('message', '未知')}")
+        info = live_data['data']
+        user_name_cache = info.get('uname', user_name_cache)
+        current_status = info.get('live_status', 0)
+        
+        if current_status != last_state['last_live_status']:
+            message_parts = []
+            if current_status == 1 and last_state['last_live_status'] != 1:
+                print(f"[+] 检测到 {user_name_cache} 开播了！")
+                last_state['last_live_title'] = info.get('title', '')
+                last_state['last_live_cover_url'] = info.get('user_cover', '')
+                message_parts = [
+                    {'type': 'text', 'data': {'text': f"{user_name_cache}开播了"}},
+                    {'type': 'image', 'data': {'file': last_state['last_live_cover_url']}}
+                ]
+            elif current_status != 1 and last_state['last_live_status'] == 1:
+                print(f"[+] 检测到 {user_name_cache} 下播了。")
+                message_parts = [
+                    {'type': 'text', 'data': {'text': f"{user_name_cache}下播了"}},
+                    {'type': 'image', 'data': {'file': last_state['last_live_cover_url']}}
+                ]
+            if message_parts:
+                await broadcast_message(message_parts)
+            last_state['last_live_status'] = current_status
+        else:
+            print("[*] 直播状态未变化。")
+    except Exception as e:
+        error_msg = f"【机器人故障】获取直播状态失败。\n错误: {e.__class__.__name__}: {e}"
+        print(f"[!] {error_msg}")
+        await send_group_message(PUSH_GROUP_ID, [{'type': 'text', 'data': {'text': error_msg}}])
+
+async def check_dynamics(httpx_client, browser, playwright_cookies, is_initial_check=False):
+    """检查B站动态，按分流规则推送到群组。"""
+    global last_state, user_name_cache
+    print(f"[*] 开始检查动态...")
+    try:
+        dynamic_api_url = f"https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?host_mid={TARGET_UID}"
+        resp_dynamic = await httpx_client.get(dynamic_api_url)
+        resp_dynamic.raise_for_status()
+        dynamic_data = resp_dynamic.json()
+        if dynamic_data.get('code') != 0 or not dynamic_data.get('data', {}).get('items'):
+            raise Exception(f"API返回错误: {dynamic_data.get('message', '未知')}")
+        items = dynamic_data['data']['items']
+        if not items: return
+        first_item = items[0]
+        is_pinned = first_item.get('modules', {}).get('module_tag', {}).get('text') == '置顶'
+        target_dynamic = items[1] if is_pinned and len(items) > 1 else first_item if not is_pinned else None
+        if not target_dynamic:
+            if is_pinned and is_initial_check: last_state['last_dynamic_id'] = first_item['id_str']
+            return
+        current_dynamic_id = target_dynamic['id_str']
+        if is_initial_check:
+            last_state['last_dynamic_id'] = current_dynamic_id
+            print(f"[*] 初始化完成，最新动态ID记录为: {current_dynamic_id}")
+            return
+        if int(current_dynamic_id) > int(last_state['last_dynamic_id']):
+            print(f"[+] 发现新动态！ID: {current_dynamic_id}")
+            last_state['last_dynamic_id'] = current_dynamic_id
+            user_name_cache = target_dynamic.get('modules', {}).get('module_author', {}).get('name', user_name_cache)
+            dyn_type = target_dynamic.get('type')
+            message_text = f"{user_name_cache}发布了新视频" if dyn_type == 'DYNAMIC_TYPE_AV' else f"{user_name_cache}发布了新动态"
+            screenshot_path = await screenshot_dynamic(browser, current_dynamic_id, playwright_cookies)
+            message_parts = [{'type': 'text', 'data': {'text': message_text}}]
+            if screenshot_path:
+                message_parts.append({'type': 'image', 'data': {'file': screenshot_path}})
+                await broadcast_message(message_parts)
+                try: os.remove(screenshot_path)
+                except OSError: pass
+            else:
+                await broadcast_message(message_parts)
+        else:
+            print("[*] 动态ID未变化。")
+    except Exception as e:
+        error_msg = f"【机器人故障】获取B站动态失败。\n错误: {e.__class__.__name__}: {e}"
+        print(f"[!] {error_msg}")
+        await send_group_message(PUSH_GROUP_ID, [{'type': 'text', 'data': {'text': error_msg}}])
+
+# --- 主程序入口 ---
+async def main():
+    cookie_json_str = load_cookie_from_file(COOKIE_FILE_PATH)
+    if not cookie_json_str: return
+    playwright_cookies = parse_cookies_for_playwright(cookie_json_str)
+    if not playwright_cookies: return
+    httpx_cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in playwright_cookies])
+    BROWSER_HEADERS['Cookie'] = httpx_cookie_str
+    print("[*] Cookie已成功加载并配置。")
+    async with async_playwright() as p:
+        print("[*] 正在启动浏览器内核...")
+        browser = await p.chromium.launch()
+        print("[+] 浏览器内核启动成功。")
+        async with httpx.AsyncClient(headers=BROWSER_HEADERS, timeout=15.0) as httpx_client:
+            print(f"\n[*] 机器人开始工作，将每隔 {CHECK_INTERVAL_SECONDS} 秒检查一次。")
+            
+            print("\n" + "="*50 + f"\n[*] {time.strftime('%Y-%m-%d %H:%M:%S')} - 开始首次状态初始化")
+            await check_live_status(httpx_client)
+            await check_dynamics(httpx_client, browser, playwright_cookies, is_initial_check=True)
+            print("="*50)
+            
+            while True:
+                await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+                print("\n" + "="*50 + f"\n[*] {time.strftime('%Y-%m-%d %H:%M:%S')} - 开始新一轮检查")
+                await check_live_status(httpx_client)
+                await check_dynamics(httpx_client, browser, playwright_cookies)
+                print("="*50)
+        await browser.close()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[*] 机器人已手动停止。")
