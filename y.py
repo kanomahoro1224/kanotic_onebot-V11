@@ -11,9 +11,9 @@ import websockets
 # --- 配置 ---
 YOUTUBE_CHANNEL_URL = "https://www.youtube.com/@Kano_/videos"
 ONEBOT_WS_URL = "ws://127.0.0.1:15700/onebot/v11/ws"
-MAIN_GROUP_ID = 977105881
+MAIN_GROUP_ID = None
 # 启用副推送群，请将 987654321 修改为您的副推送群号
-SUB_GROUP_ID = 987654321
+SUB_GROUP_ID = [None]
 
 # --- 全局变量 ---
 latest_video_url = ""
